@@ -1,0 +1,16 @@
+{
+  "id": "1f64b728-61b0-42f9-99fe-d7284e219323",
+  "title": "Tell me a joke. I like puns!",
+  "created_at": "2026-03-15T21:38:42.016659+00:00",
+  "updated_at": "2026-03-15T21:38:56.097160+00:00",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Tell me a joke. I like puns!"
+    },
+    {
+      "role": "assistant",
+      "content": "Here's one that's egg-cellent:\n\nWhy did the egg go to therapy?\n\nBecause it was cracking under the pressure!\n\nHope that made you laugh and cracked you up!"
+    }
+  ]
+}
