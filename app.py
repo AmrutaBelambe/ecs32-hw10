@@ -1,4 +1,4 @@
-﻿import json
+import json
 import time
 import uuid
 from datetime import datetime, timezone
@@ -45,6 +45,44 @@ CUE_PATTERNS = {
     "occupation": ["i am a", "i'm a", "i work as", "my job is"],
 }
 
+ACRONYMS = {
+    "AI",
+    "API",
+    "SQL",
+    "UI",
+    "UX",
+    "LLM",
+    "NLP",
+    "CPU",
+    "GPU",
+    "HTML",
+    "CSS",
+    "JSON",
+    "HTTP",
+    "HTTPS",
+    "URL",
+    "URLs",
+    "IP",
+    "TCP",
+    "UDP",
+    "AWS",
+    "GCP",
+}
+
+LIKE_PATTERNS = [
+    "i like",
+    "i love",
+    "i enjoy",
+    "i prefer",
+]
+
+DISLIKE_PATTERNS = [
+    "i don't like",
+    "i dont like",
+    "i dislike",
+    "i hate",
+]
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -86,6 +124,97 @@ def chat_title(messages: list[dict]) -> str:
             if content:
                 return (content[:32] + "…") if len(content) > 32 else content
     return "New Chat"
+
+
+def tokenize(text: str) -> list[str]:
+    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text)
+    return [w for w in cleaned.split() if w]
+
+
+def title_case(text: str) -> str:
+    titled = text.title()
+    words = [w.upper() if w.upper() in ACRONYMS else w for w in titled.split()]
+    return " ".join(words)
+
+
+def normalize_interest(phrase: str) -> str:
+    cleaned = phrase.strip()
+    if not cleaned:
+        return ""
+    if cleaned.lower().startswith("to "):
+        cleaned = cleaned[3:].strip()
+    if " " not in cleaned:
+        if cleaned.endswith("ing"):
+            return cleaned
+        if cleaned.endswith("e"):
+            return cleaned[:-1] + "ing"
+        if cleaned.endswith("y"):
+            return cleaned[:-1] + "ying"
+        return cleaned + "ing"
+    return cleaned
+
+
+def extract_list_segment(text: str) -> list[str]:
+    text = text.replace(" and ", ",")
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    return parts
+
+
+def clamp_clause(text: str) -> str:
+    cutoffs = []
+    for mark in [".", "?", "!", ";"]:
+        pos = text.find(mark)
+        if pos != -1:
+            cutoffs.append(pos)
+    for marker in ["suggest", "recommend", "help me", "can you"]:
+        pos = text.find(marker)
+        if pos != -1:
+            cutoffs.append(pos)
+    if not cutoffs:
+        return text
+    return text[: min(cutoffs)].strip()
+
+
+def extract_interests_from_text(user_message: str) -> tuple[list[str], list[str]]:
+    lowered = user_message.lower()
+    interests: list[str] = []
+    dislikes: list[str] = []
+
+    for pattern in LIKE_PATTERNS:
+        if pattern in lowered:
+            segment = lowered.split(pattern, 1)[1]
+            segment = clamp_clause(segment)
+            items = extract_list_segment(segment)
+            for item in items:
+                normalized = normalize_interest(item)
+                if normalized:
+                    interests.append(normalized)
+
+    for pattern in DISLIKE_PATTERNS:
+        if pattern in lowered:
+            segment = lowered.split(pattern, 1)[1]
+            segment = clamp_clause(segment)
+            items = extract_list_segment(segment)
+            for item in items:
+                cleaned = item.strip()
+                if cleaned:
+                    dislikes.append(cleaned)
+
+    return interests, dislikes
+
+
+def first_phrase(text: str) -> str:
+    for separator in ["\n", ".", "?", "!", ";", ":"]:
+        text = text.replace(separator, "|")
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+    return parts[0] if parts else ""
+
+
+def fallback_title(user_message: str) -> str:
+    phrase = first_phrase(user_message)
+    if not phrase:
+        return "New Chat"
+    return title_case(phrase)
 
 
 def serialize_chat(chat: dict) -> dict:
@@ -228,6 +357,29 @@ def merge_memory(existing: dict, new_data: dict) -> dict:
     return merged
 
 
+def dedupe_across_categories(memory: dict) -> dict:
+    priority_lists = ["interests", "favorite_topics", "dislikes"]
+    seen = set()
+    cleaned = dict(memory)
+
+    for field in priority_lists:
+        values = cleaned.get(field)
+        if not isinstance(values, list):
+            continue
+        kept = []
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            norm = item.strip().lower()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            kept.append(item.strip())
+        cleaned[field] = kept
+
+    return cleaned
+
+
 def summarize_memory(memory: dict) -> str:
     lines = [f"{key}: {value}" for key, value in memory.items()]
     return "User preferences: " + "; ".join(lines)
@@ -367,6 +519,10 @@ if "active_chat_id" not in st.session_state:
     st.session_state["active_chat_id"] = None
 if "memory" not in st.session_state:
     st.session_state["memory"] = merge_memory({}, load_memory())
+if "pending_user_input" not in st.session_state:
+    st.session_state["pending_user_input"] = None
+if "pending_chat_id" not in st.session_state:
+    st.session_state["pending_chat_id"] = None
 
 if st.session_state["chats"] and st.session_state["active_chat_id"] is None:
     st.session_state["active_chat_id"] = st.session_state["chats"][0]["id"]
@@ -400,16 +556,17 @@ with st.sidebar.container(height=460):
         stamp = format_relative(chat.get("updated_at"))
 
         row = st.container()
-        cols = row.columns([0.82, 0.18])
+        cols = row.columns([0.90, 0.10])
         with cols[0]:
             label = f"▶ {title}" if is_active else title
-            if st.button(label, key=f"chat-select-{chat['id']}"):
+            select_clicked = st.button(label, key=f"chat-select-{chat['id']}")
+            if select_clicked:
                 st.session_state["active_chat_id"] = chat["id"]
                 st.rerun()
             if stamp:
                 st.caption(stamp)
         with cols[1]:
-            if st.button("✕", key=f"chat-del-{chat['id']}"):
+            if st.button("✕", key=f"chat-del-{chat['id']}", type="primary"):
                 current_id = st.session_state["active_chat_id"]
                 st.session_state["chats"] = [
                     c for c in st.session_state["chats"] if c["id"] != chat["id"]
@@ -426,7 +583,7 @@ with st.sidebar.container(height=460):
 
 with st.sidebar.expander("User Memory", expanded=True):
     st.json(st.session_state.get("memory", {}))
-    if st.button("Clear Memory"):
+    if st.button("Clear Memory", type="primary"):
         st.session_state["memory"] = {}
         save_memory({})
         st.rerun()
@@ -462,10 +619,18 @@ user_input = st.chat_input("Type a message and press Enter")
 if user_input:
     active_chat["messages"].append({"role": "user", "content": user_input})
     if not active_chat.get("title") or active_chat.get("title") == "New Chat":
-        active_chat["title"] = chat_title(active_chat["messages"])
+        active_chat["title"] = fallback_title(user_input)
     active_chat["updated_at"] = now_utc()
     save_chat(active_chat)
     sort_chats_by_updated()
+    st.session_state["pending_user_input"] = user_input
+    st.session_state["pending_chat_id"] = active_chat["id"]
+    st.rerun()
+
+pending_user_input = st.session_state.get("pending_user_input")
+if pending_user_input and st.session_state.get("pending_chat_id") == active_chat["id"]:
+    st.session_state["pending_user_input"] = None
+    st.session_state["pending_chat_id"] = None
 
     memory = st.session_state.get("memory", {})
     system_message = None
@@ -500,6 +665,7 @@ if user_input:
                 f"API error {response.status_code}: {response.text.strip() or 'Unknown error'}"
             )
         else:
+            response.encoding = "utf-8"
             streamed_text = ""
             with st.chat_message("assistant"):
                 placeholder = st.empty()
@@ -532,10 +698,26 @@ if user_input:
                 save_chat(active_chat)
                 sort_chats_by_updated()
 
-                extracted = extract_memory_from_message(hf_token, user_input)
+                extracted = extract_memory_from_message(hf_token, pending_user_input)
+                interests, dislikes = extract_interests_from_text(pending_user_input)
+
                 if extracted:
-                    st.session_state["memory"] = merge_memory(
-                        st.session_state.get("memory", {}), extracted
+                    if interests:
+                        extracted["interests"] = interests
+                    if dislikes:
+                        extracted["dislikes"] = dislikes
+                    st.session_state["memory"] = dedupe_across_categories(
+                        merge_memory(st.session_state.get("memory", {}), extracted)
+                    )
+                    save_memory(st.session_state["memory"])
+                elif interests or dislikes:
+                    extracted = {}
+                    if interests:
+                        extracted["interests"] = interests
+                    if dislikes:
+                        extracted["dislikes"] = dislikes
+                    st.session_state["memory"] = dedupe_across_categories(
+                        merge_memory(st.session_state.get("memory", {}), extracted)
                     )
                     save_memory(st.session_state["memory"])
 
